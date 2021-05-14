@@ -2,9 +2,28 @@ from flask import Flask, request, abort
 from event.about_us import about_us_event
 from event.products import products_event
 from event.cart import cart_event
+from event.contact import contact_event
+from event.exchange_rate import exchange_rate_event
 from event.line_bot_api import *
-import requests
+from event.booking import booking_event
+from urllib.parse import parse_qsl
+from modles.database import db_session, init_db
+from modles.user import User
+from modles.appointment import Appointment
+import datetime
+
 app = Flask(__name__)
+
+
+@app.before_first_request
+def init():
+    init_db()
+
+
+@app.teardown_appcontext
+def shutdown_session(exception=None):
+    db_session.remove()
+
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -23,28 +42,71 @@ def callback():
         abort(400)
 
     return 'OK'
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    message_text=str(event.message.text)
-    coin_text=message_text.split("換")
-    print(coin_text)
-    if message_text=="What is your story?":
+    user_id = event.source.user_id
+    user = User.query.filter(User.id == user_id).first()
+    if not user:
+        user = User(id=user_id)
+        db_session.add(user)
+        db_session.commit()
+
+    if event.message.text == "What is your story?":
         about_us_event(event)
-    elif message_text=="i am ready to order":
+    elif event.message.text == "i am ready to order":
         products_event(event)
-    elif message_text=="my cart":
+    elif event.message.text == "my cart":
         cart_event(event)
-    elif "換" in message_text:
-        resp = requests.get('https://tw.rter.info/capi.php')
-        currency_data = resp.json()
-        t=coin_text[0]+coin_text[1]
-        print(t)
-        _to_ = currency_data[t]['Exrate']
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="{}對{}=1:{}".format(coin_text[0],coin_text[1],_to_)))
+    elif "換" in event.message.text:
+        exchange_rate_event(event)
+    elif event.message.text == "contact":
+        contact_event(event)
+    elif event.message.text == "預約":
+        booking_event(event)
     else:
-        line_bot_api.reply_message(event.reply_token,TextSendMessage(text=event.message.text))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=event.message.text))
+
+
+@handler.add(PostbackEvent)
+def handler_postback(event):
+    data = dict(parse_qsl(event.postback.data))
+    if data['action'] == 'step2':
+        now = datetime.datetime.now()
+        max_date = now + datetime.timedelta(days=30)
+        line_bot_api.reply_message(event.reply_token,
+                                   TemplateSendMessage(
+                                       alt_text="時間選擇",
+                                       template=ImageCarouselTemplate(
+                                           columns=[
+                                               ImageCarouselColumn(
+                                                   image_url='https://i.imgur.com/z8AaD3D.png',
+                                                   action=DatetimePickerAction(
+                                                       label="挑選時間",
+                                                       data="action=step3&service={}".format(data['service']),
+                                                       mode="datetime",
+                                                       initial=now.strftime("%Y-%m-%dT00:00"),
+                                                       min=now.strftime("%Y-%m-%dT00:00"),
+                                                       max=max_date.strftime("%Y-%m-%dT23:59")
+                                                   )
+                                               )
+                                           ]
+                                       )
+                                   ))
+    if data['action'] == 'step3':
+        data['time'] = datetime.datetime.strptime(event.postback.params.get('datetime'), '%Y-%m-%dT%H:%M')
+        data['name'] = line_bot_api.get_profile(event.source.user_id).display_name
+        appointment = Appointment(user_id=data['name'],
+                                  appointment_service=data['service'],
+                                  appointment_datetime=data['time'])
+        db_session.add(appointment)
+        db_session.commit()
+        line_bot_api.reply_message(event.reply_token,
+                                   TextSendMessage(
+                                       text="用戶{}\n你預約了{}\n時間為\n{}\n謝謝"
+                                           .format(data['name'], data['service'], data['time'])))
+
 
 if __name__ == "__main__":
     app.run()
